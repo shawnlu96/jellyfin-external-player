@@ -29,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -135,10 +135,22 @@ def find_potplayer_window() -> int | None:
 
 
 def get_potplayer_position_ms(hwnd: int) -> int | None:
-    """Query PotPlayer for current playback position in milliseconds."""
+    """Query PotPlayer for current playback position in milliseconds.
+
+    PotPlayer's reverse-engineered API uses wParam=0x64 (not 0) on
+    WM_USER+0x64 to get current time; wParam=0x65 gets duration.
+    """
     try:
-        pos = _user32.SendMessageW(hwnd, POT_GET_CURRENT_TIME_MS, 0, 0)
+        pos = _user32.SendMessageW(hwnd, POT_GET_CURRENT_TIME_MS, 0x64, 0)
         return int(pos) if pos > 0 else None
+    except OSError:
+        return None
+
+
+def get_potplayer_duration_ms(hwnd: int) -> int | None:
+    try:
+        dur = _user32.SendMessageW(hwnd, POT_GET_CURRENT_TIME_MS, 0x65, 0)
+        return int(dur) if dur > 0 else None
     except OSError:
         return None
 
@@ -282,12 +294,18 @@ class Session:
         return url
 
     def watch_and_report(self) -> None:
-        """Block until PotPlayer exits, then POST progress back to Jellyfin.
+        """Block until PotPlayer exits, then POST true playback position
+        back to Jellyfin. A background poller queries PotPlayer's Win32 IPC
+        every 2s; we use the latest observed value.
 
-        While PotPlayer is alive, a poller thread queries the live playback
-        position via Win32 IPC every 2s and caches it. On exit we use the
-        latest cached value (accurate even when the user seeks)."""
+        If IPC never returned a position (PotPlayer failed to start, IPC
+        protocol changed in a future build, etc.) we DO NOT fall back to
+        elapsed-time estimation — estimation produces wrong values whenever
+        the user seeks. We just skip the Stopped report and log a warning;
+        Jellyfin's Continue Watching stays at whatever the Playing call
+        set, which is accurate as a starting position."""
         assert self.process is not None
+        self.ipc_succeeded = False
         poller = threading.Thread(target=self._poll_position, daemon=True)
         poller.start()
 
@@ -295,28 +313,25 @@ class Session:
         elapsed_seconds = int(time.time() - self.started_at)
         log.info("PotPlayer exited after %ds", elapsed_seconds)
 
-        # Use last polled position; fall back to elapsed-based estimate if
-        # poller never saw a valid value (e.g. PotPlayer started but failed).
-        position_ticks = self.last_position_ticks
-        if position_ticks == self.start_position_ticks:
-            estimated = self.start_position_ticks + (elapsed_seconds * 10_000_000)
-            log.info(
-                "no IPC position observed; estimated from elapsed: %d ticks",
-                estimated,
+        if not self.ipc_succeeded:
+            log.warning(
+                "no IPC position observed during playback — skipping Stopped "
+                "report to avoid corrupting Jellyfin progress with a guess"
             )
-            position_ticks = estimated
-        else:
-            log.info("final position from IPC: %d ticks", position_ticks)
+            return
 
-        self._report_stopped(position_ticks)
+        log.info("final position from IPC: %d ticks", self.last_position_ticks)
+        self._report_stopped(self.last_position_ticks)
 
     def _poll_position(self) -> None:
         """Background poller: every 2s ask PotPlayer where it is."""
         hwnd: int | None = None
-        hwnd_search_deadline = time.time() + 30  # give PotPlayer up to 30s to open
+        hwnd_search_deadline = time.time() + 30
+        logged_first_pos = False
         while self.process and self.process.poll() is None:
             if hwnd is None:
                 if time.time() > hwnd_search_deadline:
+                    log.warning("could not find PotPlayer window within 30s")
                     return
                 hwnd = find_potplayer_window()
                 if hwnd is None:
@@ -325,11 +340,15 @@ class Session:
                 log.info("PotPlayer hwnd: 0x%x", hwnd)
             pos_ms = get_potplayer_position_ms(hwnd)
             if pos_ms is not None and pos_ms > 0:
-                # Convert ms -> 100ns ticks
-                self.last_position_ticks = pos_ms * 10_000
-            else:
-                # Window may have closed; force re-discover next loop
-                hwnd = None
+                self.last_position_ticks = pos_ms * 10_000  # ms -> 100ns ticks
+                self.ipc_succeeded = True
+                if not logged_first_pos:
+                    dur_ms = get_potplayer_duration_ms(hwnd) or 0
+                    log.info(
+                        "IPC ok: position=%dms duration=%dms",
+                        pos_ms, dur_ms,
+                    )
+                    logged_first_pos = True
             time.sleep(2)
 
     def _session_id(self) -> str:
