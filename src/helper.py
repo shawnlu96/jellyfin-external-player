@@ -29,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -391,58 +391,66 @@ class Session:
         self._report_stopped(self.last_position_ticks)
 
     def _poll_position(self) -> None:
-        """Background poller: every 2s ask PotPlayer where it is.
+        """Background poller. Strategy:
+        1. Wait 10s for PotPlayer to start playback (need real position values).
+        2. EXHAUSTIVE probe: every PotPlayer-owned window × every wParam 0..255
+           on a few candidate msg ids (0x460-0x4FF range). Log every non-zero.
+        3. Pick (hwnd, msg, wparam) returning a plausible 0..24h ms as winner.
+        4. Re-poll the winner every 2s until exit."""
+        time.sleep(10)  # let PotPlayer initialize playback
+        if not self.process or self.process.poll() is not None:
+            return
 
-        Strategy: try each known IPC probe across ALL windows owned by the
-        PotPlayer process (top-level + children). Whichever (hwnd, probe)
-        combination returns a plausible value (0..24h ms) wins. We stick
-        with that pair for subsequent polls."""
-        hwnd_search_deadline = time.time() + 15
-        winning_hwnd: int | None = None
-        winning_probe: tuple[int, int] | None = None  # (msg, wparam)
-        logged_dump = False
+        all_wins = enum_all_windows_for_pid(self.process.pid)
+        log.info(
+            "EXHAUSTIVE PROBE: enumerating %d windows for PotPlayer pid=%d",
+            len(all_wins), self.process.pid,
+        )
+        # Skip windows that can't possibly host IPC
+        skip_classes = {
+            "tooltips_class32", "IME", "MSCTFIME UI", "ComboLBox", "Edit",
+            "ComboBox", "SysTabControl32", "Static",
+        }
+        candidate_wins = [w for w in all_wins if w[1] not in skip_classes]
+        log.info("probing %d candidate windows (skipped %d noise)",
+                 len(candidate_wins), len(all_wins) - len(candidate_wins))
 
+        candidate_msgs = [0x464, 0x465, 0x460, 0x461, 0x4C8, 0x500]
+        winning: tuple[int, int, int] | None = None  # (hwnd, msg, wparam)
+
+        for h, c, t, _ in candidate_wins:
+            for msg in candidate_msgs:
+                for w in range(256):
+                    try:
+                        v = _user32.SendMessageW(h, msg, w, 0)
+                    except OSError:
+                        continue
+                    if v == 0:
+                        continue
+                    # Any non-zero response — log it
+                    plausible_ms = 0 < v < 24 * 3600 * 1000
+                    log.info(
+                        "  RESPONSE: hwnd=0x%x class=%r msg=0x%x w=0x%x -> %d %s",
+                        h, c, msg, w, v,
+                        "[PLAUSIBLE ms!]" if plausible_ms else "",
+                    )
+                    if plausible_ms and winning is None:
+                        winning = (h, msg, w)
+                        log.info("  WINNER LOCKED: %s", winning)
+
+        if winning is None:
+            log.warning(
+                "EXHAUSTIVE PROBE found no plausible IPC response — "
+                "this PotPlayer build does not expose SendMessage IPC. "
+                "Switching to mpv is the only path to accurate progress."
+            )
+            return
+
+        # Re-poll winner every 2s
+        hwnd, msg, wparam = winning
         while self.process and self.process.poll() is None:
-            if winning_hwnd is None:
-                if time.time() > hwnd_search_deadline:
-                    log.warning("no responsive PotPlayer IPC window in 15s")
-                    return
-                # Enum all windows of PotPlayer process
-                all_wins = enum_all_windows_for_pid(self.process.pid)
-                if not all_wins:
-                    time.sleep(0.5)
-                    continue
-                if not logged_dump:
-                    log.info("PotPlayer windows (pid=%d):", self.process.pid)
-                    for h, c, t, v in all_wins:
-                        log.info("  hwnd=0x%x vis=%s class=%r title=%r", h, v, c, t[:80])
-                    logged_dump = True
-                # Probe every (hwnd, probe) combination
-                for h, _, _, _ in all_wins:
-                    for msg, wparam, label in IPC_PROBES:
-                        try:
-                            v = _user32.SendMessageW(h, msg, wparam, 0)
-                            if 0 < v < 24 * 3600 * 1000:
-                                winning_hwnd = h
-                                winning_probe = (msg, wparam)
-                                log.info(
-                                    "IPC winner: hwnd=0x%x %s -> %dms",
-                                    h, label, v,
-                                )
-                                break
-                        except OSError:
-                            continue
-                    if winning_hwnd is not None:
-                        break
-                if winning_hwnd is None:
-                    time.sleep(2)
-                    continue
-                hwnd = winning_hwnd
-            # ── from here on, hwnd is winning_hwnd ──
-
-            # Re-probe winning combo on each poll
             try:
-                v = _user32.SendMessageW(hwnd, winning_probe[0], winning_probe[1], 0)
+                v = _user32.SendMessageW(hwnd, msg, wparam, 0)
                 if 0 < v < 24 * 3600 * 1000:
                     self.last_position_ticks = int(v) * 10_000
                     self.ipc_succeeded = True
