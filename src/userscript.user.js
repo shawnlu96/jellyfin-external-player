@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Player (PotPlayer)
 // @namespace    https://github.com/shawnlu96/jellyfin-external-player
-// @version      0.1.6
+// @version      0.2.2
 // @description  Hand off Jellyfin web playback to PotPlayer; progress synced back on player close.
 // @author       shawnlu96
 // @match        *://*/*
@@ -262,6 +262,24 @@
       title = `${item.SeriesName} S${String(item.ParentIndexNumber).padStart(2, '0')}E${String(item.IndexNumber).padStart(2, '0')} — ${item.Name}`;
     }
 
+    // External subtitles — Jellyfin exposes them at
+    // /Videos/{itemId}/{mediaSourceId}/Subtitles/{streamIndex}/Stream.{codec}?api_key=
+    // Collect in priority order: IsDefault first, then IsForced, then the rest.
+    const subtitleUrls = [];
+    const streams = mediaSource.MediaStreams || [];
+    const subStreams = streams.filter(
+      (s) => s.Type === 'Subtitle' && s.IsExternal && s.Codec
+    );
+    subStreams.sort((a, b) => {
+      const score = (s) => (s.IsDefault ? 0 : s.IsForced ? 1 : 2);
+      return score(a) - score(b);
+    });
+    for (const s of subStreams) {
+      subtitleUrls.push(
+        `${serverAddress}/Videos/${itemId}/${mediaSource.Id}/Subtitles/${s.Index}/Stream.${s.Codec}?api_key=${encodeURIComponent(accessToken)}`
+      );
+    }
+
     return {
       serverAddress,
       accessToken,
@@ -271,6 +289,7 @@
       streamUrl,
       title,
       startPositionTicks: (item.UserData && item.UserData.PlaybackPositionTicks) || 0,
+      subtitleUrls,
     };
   }
 

@@ -27,7 +27,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -173,12 +173,22 @@ class Session:
 
         # PotPlayer parses its own cmdline by splitting on spaces (not via
         # Windows CommandLineToArgvW), so options with spaces in values get
-        # mangled even when properly quoted. Skip /title= entirely —
-        # PotPlayer will auto-derive the window title from the URL filename
-        # (which is what the user sees anyway). The title we built was only
-        # cosmetic.
+        # mangled even when properly quoted. Skip /title= entirely — the
+        # URL filename is already a usable window title.
         log.info("PotPlayer URL: %s", url)
         args = [self.potplayer_path, url, f"/seek={seek_arg}"]
+
+        # External subtitles: PotPlayer /sub=URL loads remote subtitle files.
+        # Pass the first (highest-priority: IsDefault > IsForced > rest).
+        # We don't append /sub for every subtitle to avoid bloating cmdline
+        # past PotPlayer's limit; PotPlayer's right-click menu can switch
+        # between server-side tracks if user wants others.
+        subtitle_urls = self.payload.get("subtitleUrls") or []
+        if subtitle_urls:
+            sub_url = subtitle_urls[0]
+            args.append(f"/sub={sub_url}")
+            log.info("subtitle: %s", sub_url[:200])
+
         log.info("launching PotPlayer: %s (seek %s)", title, seek_arg)
         self.process = subprocess.Popen(args)
         self.started_at = time.time()
