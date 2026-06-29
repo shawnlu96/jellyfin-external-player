@@ -4,6 +4,7 @@ Listens on 127.0.0.1:54321 for play requests from the Tampermonkey userscript,
 launches PotPlayer with the right seek position, and on PotPlayer exit reports
 the final playback position back to Jellyfin so "Continue Watching" works.
 """
+import ctypes
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import winreg
+from ctypes import wintypes
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.3.0"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -90,52 +92,55 @@ def find_potplayer() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# PotPlayer registry — read last playback position on exit
+# PotPlayer IPC — query current playback position via Win32 SendMessage
 # ---------------------------------------------------------------------------
+# PotPlayer registers WM_USER + 0x64 (GetCurrentTime, returns ms) and
+# WM_USER + 0x65 (GetTotalTime, returns ms) on its main window. These are
+# reverse-engineered from third-party PotPlayer remote-control tools.
+# Window classes seen in the wild: PotPlayer64, PotPlayerMini64, PotPlayer.
 
-POTPLAYER_REG_PATHS = [
-    r"Software\DAUM\PotPlayerMini64\RecentFileList",
-    r"Software\DAUM\PotPlayer64\RecentFileList",
-    r"Software\DAUM\PotPlayerMini\RecentFileList",
-]
+POTPLAYER_WINDOW_CLASSES = {
+    "PotPlayer64",
+    "PotPlayerMini64",
+    "PotPlayer",
+    "PotPlayerMini",
+}
+WM_USER = 0x0400
+POT_GET_CURRENT_TIME_MS = WM_USER + 0x64
+POT_GET_TOTAL_TIME_MS = WM_USER + 0x65
+
+_user32 = ctypes.windll.user32
+_user32.SendMessageW.restype = ctypes.c_long
+_user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_long, ctypes.c_long]
+
+_EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
 
-def read_last_position(stream_url: str) -> int | None:
-    """Read PotPlayer's last playback position for the given URL.
+def find_potplayer_window() -> int | None:
+    """Find the first visible PotPlayer top-level window."""
+    found: list[int] = []
 
-    PotPlayer writes RecentFileList\\Entry%d entries as REG_BINARY containing
-    UTF-16LE path followed by metadata. Position is appended as the file's
-    "last position" 8 bytes (100ns ticks, same unit as Jellyfin PositionTicks).
-    """
-    for reg_path in POTPLAYER_REG_PATHS:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path) as key:
-                entries = []
-                n_values = winreg.QueryInfoKey(key)[1]
-                for i in range(n_values):
-                    name, data, _ = winreg.EnumValue(key, i)
-                    if not name.startswith("File"):
-                        continue
-                    entries.append((name, data))
-                # Find entry whose path matches stream_url
-                target = stream_url.split("?", 1)[0].lower()
-                for name, data in entries:
-                    if not isinstance(data, str):
-                        continue
-                    if target in data.lower() or stream_url.lower() in data.lower():
-                        # Sibling key "Position{N}" may carry the ticks
-                        suffix = name[len("File"):]
-                        try:
-                            pos_data, _ = winreg.QueryValueEx(key, f"Position{suffix}")
-                            if isinstance(pos_data, int):
-                                return int(pos_data)
-                        except FileNotFoundError:
-                            pass
-        except FileNotFoundError:
-            continue
-        except OSError as e:
-            log.warning("read registry %s failed: %s", reg_path, e)
-    return None
+    def cb(hwnd, _):
+        if not _user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(64)
+        _user32.GetClassNameW(hwnd, buf, 64)
+        if buf.value in POTPLAYER_WINDOW_CLASSES:
+            found.append(hwnd)
+            return False  # stop enum
+        return True
+
+    _user32.EnumWindows(_EnumWindowsProc(cb), 0)
+    return found[0] if found else None
+
+
+def get_potplayer_position_ms(hwnd: int) -> int | None:
+    """Query PotPlayer for current playback position in milliseconds."""
+    try:
+        pos = _user32.SendMessageW(hwnd, POT_GET_CURRENT_TIME_MS, 0, 0)
+        return int(pos) if pos > 0 else None
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +154,9 @@ class Session:
         self.process: subprocess.Popen | None = None
         self.started_at: float = 0.0
         self.start_position_ticks: int = int(payload.get("startPositionTicks") or 0)
+        # Last known playback position in 100ns ticks. Polled from PotPlayer
+        # IPC; falls back to start_position_ticks until first poll succeeds.
+        self.last_position_ticks: int = self.start_position_ticks
 
     def launch(self) -> None:
         url = self.payload["streamUrl"]
@@ -274,21 +282,55 @@ class Session:
         return url
 
     def watch_and_report(self) -> None:
-        """Block until PotPlayer exits, then POST progress back to Jellyfin."""
+        """Block until PotPlayer exits, then POST progress back to Jellyfin.
+
+        While PotPlayer is alive, a poller thread queries the live playback
+        position via Win32 IPC every 2s and caches it. On exit we use the
+        latest cached value (accurate even when the user seeks)."""
         assert self.process is not None
+        poller = threading.Thread(target=self._poll_position, daemon=True)
+        poller.start()
+
         self.process.wait()
         elapsed_seconds = int(time.time() - self.started_at)
         log.info("PotPlayer exited after %ds", elapsed_seconds)
 
-        # Try to read precise position from registry; fall back to elapsed time
-        position_ticks = read_last_position(self.payload["streamUrl"])
-        if position_ticks is None:
-            position_ticks = self.start_position_ticks + (elapsed_seconds * 10_000_000)
-            log.info("registry position not found, estimated from elapsed: %d ticks", position_ticks)
+        # Use last polled position; fall back to elapsed-based estimate if
+        # poller never saw a valid value (e.g. PotPlayer started but failed).
+        position_ticks = self.last_position_ticks
+        if position_ticks == self.start_position_ticks:
+            estimated = self.start_position_ticks + (elapsed_seconds * 10_000_000)
+            log.info(
+                "no IPC position observed; estimated from elapsed: %d ticks",
+                estimated,
+            )
+            position_ticks = estimated
         else:
-            log.info("registry position: %d ticks", position_ticks)
+            log.info("final position from IPC: %d ticks", position_ticks)
 
         self._report_stopped(position_ticks)
+
+    def _poll_position(self) -> None:
+        """Background poller: every 2s ask PotPlayer where it is."""
+        hwnd: int | None = None
+        hwnd_search_deadline = time.time() + 30  # give PotPlayer up to 30s to open
+        while self.process and self.process.poll() is None:
+            if hwnd is None:
+                if time.time() > hwnd_search_deadline:
+                    return
+                hwnd = find_potplayer_window()
+                if hwnd is None:
+                    time.sleep(0.5)
+                    continue
+                log.info("PotPlayer hwnd: 0x%x", hwnd)
+            pos_ms = get_potplayer_position_ms(hwnd)
+            if pos_ms is not None and pos_ms > 0:
+                # Convert ms -> 100ns ticks
+                self.last_position_ticks = pos_ms * 10_000
+            else:
+                # Window may have closed; force re-discover next loop
+                hwnd = None
+            time.sleep(2)
 
     def _session_id(self) -> str:
         return self.payload.get("playSessionId") or f"ep-{APP_NAME}-{int(self.started_at or time.time())}"
