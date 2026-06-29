@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Player (PotPlayer)
 // @namespace    https://github.com/shawnlu96/jellyfin-external-player
-// @version      0.1.2
+// @version      0.1.4
 // @description  Hand off Jellyfin web playback to PotPlayer; progress synced back on player close.
 // @author       shawnlu96
 // @match        *://*/*

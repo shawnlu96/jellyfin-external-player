@@ -27,6 +27,9 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
+APP_VERSION = "0.1.4"
+GITHUB_REPO = "shawnlu96/jellyfin-external-player"
+UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "helper.log"
@@ -153,6 +156,14 @@ class Session:
         seek_seconds = self.start_position_ticks // 10_000_000
         seek_arg = time.strftime("%H:%M:%S", time.gmtime(seek_seconds))
 
+        # Jellyfin /Videos/{id}/stream returns application/oct-stream which
+        # PotPlayer doesn't recognize as video. Hint the container via the
+        # /stream.mkv URL form — Jellyfin then returns video/x-matroska and
+        # PotPlayer plays it directly.
+        if "/stream?" in url and ".mkv" not in url and ".mp4" not in url:
+            url = url.replace("/stream?", "/stream.mkv?", 1)
+            log.info("rewrote stream URL with .mkv container hint")
+
         # Preflight: check what Jellyfin's /Videos/.../stream actually returns.
         # For .strm items, Jellyfin should 302-redirect to the real media URL.
         # If we see a 302, follow it manually so PotPlayer gets the final URL —
@@ -171,9 +182,17 @@ class Session:
         self.process = subprocess.Popen(args)
         self.started_at = time.time()
 
-    def _resolve_redirect(self, url: str) -> str:
+    def _resolve_redirect(self, url: str, depth: int = 0) -> str:
         """Follow Jellyfin's stream URL through redirects; return the final
-        playable URL. Logs each hop. Returns the original URL on failure."""
+        playable URL. Handles three cases:
+          1. Direct video stream (200 + video/* content-type)  -> use as-is
+          2. 302 redirect chain                                  -> follow
+          3. Jellyfin .strm returned as application/oct-stream  -> peek body,
+             extract the inner URL, recurse
+        Logs every hop. Returns the original URL on failure."""
+        if depth > 3:
+            log.warning("preflight: recursion depth exceeded, abort")
+            return url
         try:
             resp = requests.get(
                 url,
@@ -182,14 +201,32 @@ class Session:
                 timeout=10,
                 headers={"User-Agent": "JellyfinExternalPlayer/1.0"},
             )
+            content_type = resp.headers.get("Content-Type", "")
             log.info(
-                "preflight status=%d content-type=%s final-url=%s",
-                resp.status_code,
-                resp.headers.get("Content-Type", "?"),
-                resp.url[:200],
+                "preflight[%d] status=%d content-type=%s final-url=%s",
+                depth, resp.status_code, content_type, resp.url[:200],
             )
             for h in resp.history:
                 log.info("  redirect: %d -> %s", h.status_code, h.headers.get("Location", "")[:200])
+
+            # Case 3: octet-stream that smells like a .strm (text URL inside)
+            if "octet-stream" in content_type or "oct-stream" in content_type:
+                sample = b""
+                for chunk in resp.iter_content(4096):
+                    sample += chunk
+                    if len(sample) >= 4096:
+                        break
+                resp.close()
+                try:
+                    text = sample.decode("utf-8", errors="ignore").strip()
+                    first_line = text.split("\n", 1)[0].strip()
+                    if first_line.startswith(("http://", "https://")) and len(first_line) < 2000:
+                        log.info("  strm content detected, inner URL: %s", first_line[:200])
+                        return self._resolve_redirect(first_line, depth + 1)
+                except Exception as e:
+                    log.warning("  strm sniff decode failed: %s", e)
+                return url  # not a strm; fall back to jellyfin's URL
+
             resp.close()
             if 200 <= resp.status_code < 400:
                 return resp.url
@@ -320,12 +357,24 @@ def make_tray():
         toggle_startup()
         icon.update_menu()
 
+    def on_check_update(icon, item):
+        check_update()
+        icon.update_menu()
+
+    def on_update_now(icon, item):
+        perform_update()  # exits process on success
+
     def on_exit(icon, item):
         icon.stop()
         os._exit(0)
 
+    def update_menu_text(item):
+        if _update_state["available"]:
+            return f"Update available: v{_update_state['version']} — click to install"
+        return "Check for updates"
+
     menu = pystray.Menu(
-        pystray.MenuItem(f"{APP_DISPLAY} (running)", None, enabled=False),
+        pystray.MenuItem(f"{APP_DISPLAY} v{APP_VERSION}", None, enabled=False),
         pystray.MenuItem(f"Port: {LISTEN_PORT}", None, enabled=False),
         pystray.MenuItem(
             "PotPlayer: " + (_potplayer_path or "NOT FOUND"),
@@ -338,10 +387,108 @@ def make_tray():
             on_toggle_startup,
             checked=lambda item: is_startup_enabled(),
         ),
+        pystray.MenuItem(
+            update_menu_text,
+            lambda icon, item: on_update_now(icon, item) if _update_state["available"] else on_check_update(icon, item),
+        ),
         pystray.MenuItem("Open log file", on_open_logs),
         pystray.MenuItem("Exit", on_exit),
     )
     return pystray.Icon(APP_NAME, image, APP_DISPLAY, menu)
+
+
+# ---------------------------------------------------------------------------
+# Self-update via GitHub Releases
+# ---------------------------------------------------------------------------
+
+_update_state: dict = {"available": False, "version": None, "url": None}
+
+
+def _version_tuple(v: str) -> tuple:
+    return tuple(int(p) for p in v.lstrip("v").split(".") if p.isdigit())
+
+
+def check_update() -> None:
+    """Query GitHub Releases API; if a newer JellyfinExternalPlayer.exe asset
+    exists, populate _update_state so the tray menu can offer it."""
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        resp = requests.get(url, timeout=10, headers={"Accept": "application/vnd.github+json"})
+        if resp.status_code != 200:
+            log.warning("update check: github api %d", resp.status_code)
+            return
+        data = resp.json()
+        latest = data.get("tag_name", "").lstrip("v")
+        if not latest or _version_tuple(latest) <= _version_tuple(APP_VERSION):
+            log.info("update check: up to date (current %s, latest %s)", APP_VERSION, latest or "?")
+            return
+        for asset in data.get("assets", []):
+            if asset.get("name") == "JellyfinExternalPlayer.exe":
+                _update_state["available"] = True
+                _update_state["version"] = latest
+                _update_state["url"] = asset.get("browser_download_url")
+                log.info("update available: v%s (%s)", latest, _update_state["url"])
+                return
+        log.info("update check: latest %s but no EXE asset found", latest)
+    except Exception as e:
+        log.warning("update check failed: %s", e)
+
+
+def update_check_loop() -> None:
+    """Daemon: check on boot + every 24h."""
+    while True:
+        check_update()
+        time.sleep(UPDATE_CHECK_INTERVAL_SEC)
+
+
+def perform_update() -> None:
+    """Download the new EXE next to the current one, write an updater batch
+    that waits for us to exit, replaces the EXE, restarts, and self-deletes."""
+    if not getattr(sys, "frozen", False):
+        log.warning("perform_update: not running from frozen EXE — skip")
+        return
+    if not _update_state["available"]:
+        log.info("perform_update: nothing to update")
+        return
+    current_exe = Path(sys.executable).resolve()
+    work_dir = current_exe.parent
+    new_exe = work_dir / f"_update_new_{_update_state['version']}.exe"
+    bat_path = work_dir / "_update.bat"
+    log.info("downloading update v%s -> %s", _update_state["version"], new_exe)
+    try:
+        with requests.get(_update_state["url"], stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(new_exe, "wb") as f:
+                for chunk in r.iter_content(64 * 1024):
+                    f.write(chunk)
+    except Exception as e:
+        log.error("download failed: %s", e)
+        return
+    bat_path.write_text(
+        f'''@echo off
+:wait
+tasklist /FI "IMAGENAME eq {current_exe.name}" 2>NUL | find /I "{current_exe.name}" >NUL
+if "%ERRORLEVEL%"=="0" (
+    timeout /t 1 /nobreak >nul
+    goto wait
+)
+move /Y "{new_exe}" "{current_exe}" >nul
+start "" "{current_exe}"
+del "%~f0"
+''',
+        encoding="utf-8",
+    )
+    # Detach the batch so it survives our exit
+    CREATE_NO_WINDOW = 0x08000000
+    DETACHED_PROCESS = 0x00000008
+    subprocess.Popen(
+        ["cmd", "/c", str(bat_path)],
+        creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+        cwd=str(work_dir),
+        close_fds=True,
+    )
+    log.info("updater spawned; exiting to release file lock")
+    os._exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +552,9 @@ def main():
 
     threading.Thread(target=run_flask, daemon=True).start()
     log.info("HTTP server on http://%s:%d", LISTEN_HOST, LISTEN_PORT)
+
+    threading.Thread(target=update_check_loop, daemon=True).start()
+    log.info("update checker started")
 
     tray = make_tray()
     tray.run()
