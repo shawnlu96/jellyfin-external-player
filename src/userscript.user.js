@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Player (PotPlayer)
 // @namespace    https://github.com/shawnlu96/jellyfin-external-player
-// @version      0.1.1
+// @version      0.1.2
 // @description  Hand off Jellyfin web playback to PotPlayer; progress synced back on player close.
 // @author       shawnlu96
 // @match        *://*/*
@@ -273,9 +273,29 @@
     btn.style.display = isDetailPage() ? '' : 'none';
   }
 
+  let inFlight = false;
+
+  function setButtonBusy(busy) {
+    const btn = document.getElementById(BUTTON_ID);
+    if (!btn) return;
+    if (busy) {
+      btn.dataset.original = btn.innerHTML;
+      btn.innerHTML = '⏳ 启动中…';
+      btn.style.opacity = '0.6';
+      btn.style.cursor = 'wait';
+      btn.disabled = true;
+    } else {
+      if (btn.dataset.original) btn.innerHTML = btn.dataset.original;
+      btn.style.opacity = '';
+      btn.style.cursor = 'pointer';
+      btn.disabled = false;
+    }
+  }
+
   async function onClick(e) {
     e.preventDefault();
     e.stopPropagation();
+    if (inFlight) return; // debounce — prevent double-launch
     const itemId = getItemIdFromUrl();
     if (!itemId) {
       toast('No item id detected on this page');
@@ -290,6 +310,8 @@
       toast('Jellyfin server address missing from credentials');
       return;
     }
+    inFlight = true;
+    setButtonBusy(true);
     try {
       const payload = await buildPayload(itemId);
       const resp = await helperPost('/play', payload);
@@ -305,6 +327,12 @@
       } else {
         toast('Error: ' + msg.slice(0, 120));
       }
+    } finally {
+      // 3s cooldown so user can't spam-launch while PotPlayer is opening
+      setTimeout(() => {
+        inFlight = false;
+        setButtonBusy(false);
+      }, 3000);
     }
   }
 

@@ -152,10 +152,50 @@ class Session:
         title = self.payload.get("title") or "Jellyfin"
         seek_seconds = self.start_position_ticks // 10_000_000
         seek_arg = time.strftime("%H:%M:%S", time.gmtime(seek_seconds))
+
+        # Preflight: check what Jellyfin's /Videos/.../stream actually returns.
+        # For .strm items, Jellyfin should 302-redirect to the real media URL.
+        # If we see a 302, follow it manually so PotPlayer gets the final URL —
+        # some PotPlayer builds choke on the redirect chain especially when the
+        # destination is on a different host (alipan OSS etc).
+        final_url = self._resolve_redirect(url)
+        if final_url != url:
+            log.info("preflight: %s -> %s", url[:120], final_url[:120])
+            url = final_url
+        else:
+            log.info("preflight: direct stream (no redirect)")
+
+        log.info("PotPlayer URL: %s", url[:200])
         args = [self.potplayer_path, url, f"/seek={seek_arg}", f"/title={title}"]
         log.info("launching PotPlayer: %s (seek %s)", title, seek_arg)
         self.process = subprocess.Popen(args)
         self.started_at = time.time()
+
+    def _resolve_redirect(self, url: str) -> str:
+        """Follow Jellyfin's stream URL through redirects; return the final
+        playable URL. Logs each hop. Returns the original URL on failure."""
+        try:
+            resp = requests.get(
+                url,
+                stream=True,
+                allow_redirects=True,
+                timeout=10,
+                headers={"User-Agent": "JellyfinExternalPlayer/1.0"},
+            )
+            log.info(
+                "preflight status=%d content-type=%s final-url=%s",
+                resp.status_code,
+                resp.headers.get("Content-Type", "?"),
+                resp.url[:200],
+            )
+            for h in resp.history:
+                log.info("  redirect: %d -> %s", h.status_code, h.headers.get("Location", "")[:200])
+            resp.close()
+            if 200 <= resp.status_code < 400:
+                return resp.url
+        except requests.RequestException as e:
+            log.warning("preflight failed: %s — falling back to original URL", e)
+        return url
 
     def watch_and_report(self) -> None:
         """Block until PotPlayer exits, then POST progress back to Jellyfin."""
