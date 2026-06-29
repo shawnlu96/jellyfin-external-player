@@ -29,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -435,9 +435,11 @@ class Session:
 
     def _poll_position(self) -> None:
         """Poll PotPlayer's playback position every 2s via SendMessage IPC.
+        Every 5 polls (≈ 10s) also POST /Sessions/Playing/Progress to
+        Jellyfin so the server has near-realtime progress — enables
+        multi-device sync and survives PotPlayer/PC crashes (max loss 10s).
 
-        Protocol (from AHK PotPlayer-Resume reverse-engineering):
-          SendMessage(hwnd, WM_USER=0x400, wParam=0x5004, lParam=0) -> ms
+        Protocol: SendMessage(hwnd, WM_USER=0x400, wParam=0x5004, lParam=0) -> ms
         Target: any top-level window of the PotPlayer process whose class
         is in POTPLAYER_WINDOW_CLASSES."""
         # Wait for PotPlayer's main window to appear (max 30s)
@@ -459,6 +461,7 @@ class Session:
             return
 
         first_log = False
+        poll_count = 0
         while self.process and self.process.poll() is None:
             pos_ms = get_potplayer_position_ms(target_hwnd)
             if pos_ms is not None and pos_ms > 0:
@@ -468,6 +471,10 @@ class Session:
                     dur_ms = get_potplayer_duration_ms(target_hwnd) or 0
                     log.info("IPC ok: position=%dms duration=%dms", pos_ms, dur_ms)
                     first_log = True
+                # Report progress every 5 polls (~10s) for multi-device sync
+                poll_count += 1
+                if poll_count % 5 == 0:
+                    self._report_progress(self.last_position_ticks)
             time.sleep(2)
 
     def _session_id(self) -> str:
@@ -483,6 +490,29 @@ class Session:
             ),
             "Content-Type": "application/json",
         }
+
+    def _report_progress(self, position_ticks: int) -> None:
+        """Live progress ping during playback — enables multi-device sync."""
+        server = self.payload["serverAddress"].rstrip("/")
+        body = {
+            "ItemId": self.payload["itemId"],
+            "MediaSourceId": self.payload.get("mediaSourceId") or self.payload["itemId"],
+            "PlaySessionId": self._session_id(),
+            "PositionTicks": position_ticks,
+            "IsPaused": False,
+            "PlayMethod": "DirectStream",
+        }
+        try:
+            resp = requests.post(
+                f"{server}/Sessions/Playing/Progress",
+                headers=self._auth_headers(),
+                json=body,
+                timeout=5,
+            )
+            if resp.status_code != 204:
+                log.warning("Progress ping non-204: %s", resp.status_code)
+        except requests.RequestException as e:
+            log.warning("Progress ping failed: %s", e)
 
     def _report_playing(self) -> None:
         server = self.payload["serverAddress"].rstrip("/")
