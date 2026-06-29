@@ -27,7 +27,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.7"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -209,7 +209,11 @@ class Session:
             for h in resp.history:
                 log.info("  redirect: %d -> %s", h.status_code, h.headers.get("Location", "")[:200])
 
-            # Case 3: octet-stream that smells like a .strm (text URL inside)
+            # Case 3: octet-stream — could be a .strm text file OR a binary
+            # video stream served with wrong mime. Disambiguate by sniffing
+            # the first 4KB:
+            #   - decodable as UTF-8 + first line is an http(s) URL  -> strm
+            #   - anything else (binary, MKV header, etc.)            -> real video
             if "octet-stream" in content_type or "oct-stream" in content_type:
                 sample = b""
                 for chunk in resp.iter_content(4096):
@@ -217,15 +221,19 @@ class Session:
                     if len(sample) >= 4096:
                         break
                 resp.close()
+                is_strm = False
                 try:
-                    text = sample.decode("utf-8", errors="ignore").strip()
-                    first_line = text.split("\n", 1)[0].strip()
+                    text = sample.decode("utf-8")  # strict — binary will raise
+                    first_line = text.strip().split("\n", 1)[0].strip()
                     if first_line.startswith(("http://", "https://")) and len(first_line) < 2000:
+                        is_strm = True
                         log.info("  strm content detected, inner URL: %s", first_line[:200])
                         return self._resolve_redirect(first_line, depth + 1)
-                except Exception as e:
-                    log.warning("  strm sniff decode failed: %s", e)
-                return url  # not a strm; fall back to jellyfin's URL
+                except UnicodeDecodeError:
+                    pass  # binary content — fall through
+                # Binary or non-URL text: trust the redirected URL as-is
+                log.info("  binary stream (not strm), using resolved URL")
+                return resp.url
 
             resp.close()
             if 200 <= resp.status_code < 400:
