@@ -27,7 +27,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.2.0"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -166,16 +166,15 @@ class Session:
         # host) without consuming the body.
         self._log_url_diagnostic(url)
 
-        # PotPlayer parses /title= and other options by splitting argv on
-        # spaces, so a title with spaces / CJK / em-dash breaks the URL
-        # following it. Quote the title explicitly. (PotPlayer accepts
-        # /option="value with spaces" syntax.)
-        # Also keep URL as args[1] — PotPlayer treats the first non-/option
-        # arg as the file to play.
+        # PotPlayer parses its own cmdline by splitting on spaces (not via
+        # Windows CommandLineToArgvW), so options with spaces in values get
+        # mangled even when properly quoted. Skip /title= entirely —
+        # PotPlayer will auto-derive the window title from the URL filename
+        # (which is what the user sees anyway). The title we built was only
+        # cosmetic.
         log.info("PotPlayer URL: %s", url)
-        title_arg = f'/title="{title}"'
-        args = [self.potplayer_path, url, f"/seek={seek_arg}", title_arg]
-        log.info("launching PotPlayer: %s (seek %s) argv=%s", title, seek_arg, args[1:])
+        args = [self.potplayer_path, url, f"/seek={seek_arg}"]
+        log.info("launching PotPlayer: %s (seek %s)", title, seek_arg)
         self.process = subprocess.Popen(args)
         self.started_at = time.time()
 
