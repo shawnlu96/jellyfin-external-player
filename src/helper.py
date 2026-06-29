@@ -29,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -143,6 +143,36 @@ def find_potplayer_window() -> int | None:
 
     _user32.EnumWindows(_EnumWindowsProc(cb), 0)
     return found[0] if found else None
+
+
+def enum_all_windows_for_pid(target_pid: int) -> list[tuple[int, str, str, bool]]:
+    """Return [(hwnd, class, title, visible)] for ALL top-level + child
+    windows owned by the given PID. Used for debug logging when we can't
+    find a responsive PotPlayer IPC window."""
+    results: list[tuple[int, str, str, bool]] = []
+
+    def collect(hwnd):
+        wpid = ctypes.c_ulong(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+        if wpid.value != target_pid:
+            return
+        cls = ctypes.create_unicode_buffer(128)
+        _user32.GetClassNameW(hwnd, cls, 128)
+        tit = ctypes.create_unicode_buffer(256)
+        _user32.GetWindowTextW(hwnd, tit, 256)
+        results.append((hwnd, cls.value, tit.value, bool(_user32.IsWindowVisible(hwnd))))
+
+    def top_cb(hwnd, _):
+        collect(hwnd)
+        # also enum children of this top-level window
+        def child_cb(child_hwnd, _):
+            collect(child_hwnd)
+            return True
+        _user32.EnumChildWindows(hwnd, _EnumWindowsProc(child_cb), 0)
+        return True
+
+    _user32.EnumWindows(_EnumWindowsProc(top_cb), 0)
+    return results
 
 
 def get_window_text(hwnd: int) -> str:
@@ -363,58 +393,61 @@ class Session:
     def _poll_position(self) -> None:
         """Background poller: every 2s ask PotPlayer where it is.
 
-        Strategy: try each known IPC probe in IPC_PROBES; whichever returns a
-        plausible value (0..24h) wins. As a third-tier fallback, parse the
-        playback timestamp from the window title (PotPlayer shows it by
-        default in "HH:MM:SS / HH:MM:SS - filename" form)."""
-        hwnd: int | None = None
-        hwnd_search_deadline = time.time() + 30
-        logged_first = False
-        winning_probe: str = ""
+        Strategy: try each known IPC probe across ALL windows owned by the
+        PotPlayer process (top-level + children). Whichever (hwnd, probe)
+        combination returns a plausible value (0..24h ms) wins. We stick
+        with that pair for subsequent polls."""
+        hwnd_search_deadline = time.time() + 15
+        winning_hwnd: int | None = None
+        winning_probe: tuple[int, int] | None = None  # (msg, wparam)
+        logged_dump = False
+
         while self.process and self.process.poll() is None:
-            if hwnd is None:
+            if winning_hwnd is None:
                 if time.time() > hwnd_search_deadline:
-                    log.warning("could not find PotPlayer window within 30s")
+                    log.warning("no responsive PotPlayer IPC window in 15s")
                     return
-                hwnd = find_potplayer_window()
-                if hwnd is None:
+                # Enum all windows of PotPlayer process
+                all_wins = enum_all_windows_for_pid(self.process.pid)
+                if not all_wins:
                     time.sleep(0.5)
                     continue
-                log.info("PotPlayer hwnd: 0x%x title=%s", hwnd, get_window_text(hwnd)[:120])
-
-            pos_ms: int | None = None
-            if winning_probe:
-                # Stick with whichever probe worked last time
-                for msg, wparam, label in IPC_PROBES:
-                    if label == winning_probe:
+                if not logged_dump:
+                    log.info("PotPlayer windows (pid=%d):", self.process.pid)
+                    for h, c, t, v in all_wins:
+                        log.info("  hwnd=0x%x vis=%s class=%r title=%r", h, v, c, t[:80])
+                    logged_dump = True
+                # Probe every (hwnd, probe) combination
+                for h, _, _, _ in all_wins:
+                    for msg, wparam, label in IPC_PROBES:
                         try:
-                            v = _user32.SendMessageW(hwnd, msg, wparam, 0)
-                            if v and 0 < v < 24 * 3600 * 1000:
-                                pos_ms = int(v)
+                            v = _user32.SendMessageW(h, msg, wparam, 0)
+                            if 0 < v < 24 * 3600 * 1000:
+                                winning_hwnd = h
+                                winning_probe = (msg, wparam)
+                                log.info(
+                                    "IPC winner: hwnd=0x%x %s -> %dms",
+                                    h, label, v,
+                                )
+                                break
                         except OSError:
-                            pass
+                            continue
+                    if winning_hwnd is not None:
                         break
-            if pos_ms is None:
-                pos_ms, label = probe_potplayer_position(hwnd)
-                if pos_ms is not None and not winning_probe:
-                    winning_probe = label
-                    log.info("IPC probe winner: %s = %dms", label, pos_ms)
+                if winning_hwnd is None:
+                    time.sleep(2)
+                    continue
+                hwnd = winning_hwnd
+            # ── from here on, hwnd is winning_hwnd ──
 
-            if pos_ms is None:
-                # Last-resort: scrape window title
-                title = get_window_text(hwnd)
-                title_pos = parse_position_from_title(title)
-                if title_pos is not None:
-                    pos_ms = title_pos
-                    if not logged_first:
-                        log.info("position from title: %dms (title=%r)", pos_ms, title[:80])
-
-            if pos_ms is not None and pos_ms > 0:
-                self.last_position_ticks = pos_ms * 10_000
-                self.ipc_succeeded = True
-                if not logged_first:
-                    log.info("first observed position: %dms", pos_ms)
-                    logged_first = True
+            # Re-probe winning combo on each poll
+            try:
+                v = _user32.SendMessageW(hwnd, winning_probe[0], winning_probe[1], 0)
+                if 0 < v < 24 * 3600 * 1000:
+                    self.last_position_ticks = int(v) * 10_000
+                    self.ipc_succeeded = True
+            except OSError:
+                pass
             time.sleep(2)
 
     def _session_id(self) -> str:
