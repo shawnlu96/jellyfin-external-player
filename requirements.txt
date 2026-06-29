@@ -1,0 +1,5 @@
+flask>=3.0
+requests>=2.31
+pystray>=0.19.5
+pillow>=10.0
+pywin32>=306
