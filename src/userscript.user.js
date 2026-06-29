@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         Jellyfin External Player (PotPlayer)
 // @namespace    https://github.com/shawnlu96/jellyfin-external-player
-// @version      1.0.0
-// @description  Add a "Play in PotPlayer" button to Jellyfin web; hands off the current item to a local helper that launches PotPlayer and reports progress back on exit.
+// @version      0.1.0
+// @description  Hand off Jellyfin web playback to PotPlayer; progress synced back on player close.
 // @author       shawnlu96
 // @match        *://*/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
+// @updateURL    https://github.com/shawnlu96/jellyfin-external-player/releases/latest/download/jellyfin-external-player.user.js
+// @downloadURL  https://github.com/shawnlu96/jellyfin-external-player/releases/latest/download/jellyfin-external-player.user.js
+// @supportURL   https://github.com/shawnlu96/jellyfin-external-player/issues
+// @homepageURL  https://github.com/shawnlu96/jellyfin-external-player
 // ==/UserScript==
 
 (function () {
@@ -122,9 +126,10 @@
   }
 
   // -----------------------------------------------------------------------
-  // 4. UI — inject button into item detail page
+  // 4. UI — floating button (theme-agnostic; works on JellyFlix and any
+  //         Jellyfin web version because it doesn't rely on detail-page DOM)
   // -----------------------------------------------------------------------
-  const BUTTON_ID = 'external-player-btn';
+  const BUTTON_ID = 'jep-floating-btn';
 
   function getItemIdFromUrl() {
     // Jellyfin SPA URL: .../#/details?id=xxxx&serverId=yyyy
@@ -133,19 +138,38 @@
     return m ? m[1] : null;
   }
 
-  function makeButton() {
-    const btn = document.createElement('button');
-    btn.id = BUTTON_ID;
-    btn.type = 'button';
-    btn.className = 'button-flat detailButton emby-button';
-    btn.title = 'Play in PotPlayer';
-    btn.innerHTML = `
-      <div class="detailButton-content">
-        <span class="material-icons detailButton-icon" aria-hidden="true">open_in_new</span>
-        <span class="detailButton-text">PotPlayer</span>
-      </div>`;
-    btn.addEventListener('click', onClick);
-    return btn;
+  function isDetailPage() {
+    return /[#&/]details(\?|$)/.test(location.hash) && !!getItemIdFromUrl();
+  }
+
+  function ensureFloatingButton() {
+    let btn = document.getElementById(BUTTON_ID);
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.id = BUTTON_ID;
+      btn.type = 'button';
+      btn.title = 'Play in PotPlayer';
+      btn.innerHTML = '▶ PotPlayer';
+      btn.style.cssText = [
+        'position:fixed', 'right:24px', 'bottom:24px', 'z-index:99998',
+        'padding:12px 20px', 'border-radius:28px', 'border:0',
+        'background:linear-gradient(135deg,#00a4dc 0%,#0078b3 100%)',
+        'color:#fff', 'font:600 14px/1 system-ui,-apple-system,sans-serif',
+        'cursor:pointer', 'box-shadow:0 4px 16px rgba(0,164,220,0.45)',
+        'transition:transform 0.15s, box-shadow 0.15s', 'display:none',
+      ].join(';');
+      btn.onmouseover = () => {
+        btn.style.transform = 'scale(1.05)';
+        btn.style.boxShadow = '0 6px 22px rgba(0,164,220,0.65)';
+      };
+      btn.onmouseout = () => {
+        btn.style.transform = '';
+        btn.style.boxShadow = '0 4px 16px rgba(0,164,220,0.45)';
+      };
+      btn.addEventListener('click', onClick);
+      document.body.appendChild(btn);
+    }
+    btn.style.display = isDetailPage() ? '' : 'none';
   }
 
   async function onClick(e) {
@@ -192,20 +216,6 @@
     el._hideTimer = setTimeout(() => (el.style.opacity = '0'), 4000);
   }
 
-  function tryInject() {
-    if (document.getElementById(BUTTON_ID)) return;
-    const itemId = getItemIdFromUrl();
-    if (!itemId) return;
-    // Try to find Jellyfin's main button row
-    const targets = [
-      document.querySelector('.mainDetailButtons'),
-      document.querySelector('.detailButton-mainButtons'),
-      document.querySelector('.mainButtons'),
-    ].filter(Boolean);
-    if (!targets.length) return;
-    targets[0].appendChild(makeButton());
-  }
-
   // -----------------------------------------------------------------------
   // 5. Boot
   // -----------------------------------------------------------------------
@@ -217,10 +227,11 @@
     }
     console.log('[jellyfin-external-player] Jellyfin detected, userscript active');
 
-    // SPA route changes — re-inject after each navigation
-    const observer = new MutationObserver(() => tryInject());
-    observer.observe(document.body, { childList: true, subtree: true });
-    tryInject();
+    // SPA route changes — re-evaluate visibility after each navigation
+    ensureFloatingButton();
+    window.addEventListener('hashchange', ensureFloatingButton);
+    window.addEventListener('popstate', ensureFloatingButton);
+    setInterval(ensureFloatingButton, 1000);
 
     // Optional: ping helper once to log status
     try {
