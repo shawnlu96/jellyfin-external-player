@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Player (PotPlayer)
 // @namespace    https://github.com/shawnlu96/jellyfin-external-player
-// @version      0.1.5
+// @version      0.1.6
 // @description  Hand off Jellyfin web playback to PotPlayer; progress synced back on player close.
 // @author       shawnlu96
 // @match        *://*/*
@@ -9,8 +9,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
-// @updateURL    https://github.com/shawnlu96/jellyfin-external-player/releases/latest/download/jellyfin-external-player.user.js
-// @downloadURL  https://github.com/shawnlu96/jellyfin-external-player/releases/latest/download/jellyfin-external-player.user.js
+// @updateURL    https://raw.githubusercontent.com/shawnlu96/jellyfin-external-player/main/src/userscript.user.js
+// @downloadURL  https://raw.githubusercontent.com/shawnlu96/jellyfin-external-player/main/src/userscript.user.js
 // @supportURL   https://github.com/shawnlu96/jellyfin-external-player/issues
 // @homepageURL  https://github.com/shawnlu96/jellyfin-external-player
 // ==/UserScript==
