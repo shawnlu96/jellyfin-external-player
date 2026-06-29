@@ -27,7 +27,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -156,6 +156,11 @@ class Session:
         seek_seconds = self.start_position_ticks // 10_000_000
         seek_arg = time.strftime("%H:%M:%S", time.gmtime(seek_seconds))
 
+        # Open a Jellyfin playback session BEFORE launching PotPlayer.
+        # Without this, /Sessions/Playing/Stopped is rejected silently —
+        # Jellyfin only records progress for sessions it has seen start.
+        self._report_playing()
+
         # IMPORTANT: do NOT preflight-resolve the URL. Many object-storage
         # signed URLs (alipan OSS, S3 pre-signed, etc.) are single-use or
         # time-sensitive — consuming the redirect ourselves invalidates the
@@ -275,29 +280,53 @@ class Session:
 
         self._report_stopped(position_ticks)
 
-    def _report_stopped(self, position_ticks: int) -> None:
-        server = self.payload["serverAddress"].rstrip("/")
+    def _session_id(self) -> str:
+        return self.payload.get("playSessionId") or f"ep-{APP_NAME}-{int(self.started_at or time.time())}"
+
+    def _auth_headers(self) -> dict:
         token = self.payload["accessToken"]
-        item_id = self.payload["itemId"]
-        play_session_id = self.payload.get("playSessionId") or f"ep-{int(self.started_at)}"
-        body = {
-            "ItemId": item_id,
-            "PositionTicks": position_ticks,
-            "PlaySessionId": play_session_id,
-            "MediaSourceId": self.payload.get("mediaSourceId") or item_id,
-        }
-        headers = {
+        return {
             "X-Emby-Token": token,
             "X-Emby-Authorization": (
                 f'MediaBrowser Client="{APP_DISPLAY}", '
-                f'Device="External Player", DeviceId="{APP_NAME}", Version="1.0.0"'
+                f'Device="External Player", DeviceId="{APP_NAME}", Version="{APP_VERSION}"'
             ),
             "Content-Type": "application/json",
+        }
+
+    def _report_playing(self) -> None:
+        server = self.payload["serverAddress"].rstrip("/")
+        body = {
+            "ItemId": self.payload["itemId"],
+            "MediaSourceId": self.payload.get("mediaSourceId") or self.payload["itemId"],
+            "PlaySessionId": self._session_id(),
+            "PositionTicks": self.start_position_ticks,
+            "CanSeek": True,
+            "PlayMethod": "DirectStream",
+        }
+        try:
+            resp = requests.post(
+                f"{server}/Sessions/Playing",
+                headers=self._auth_headers(),
+                json=body,
+                timeout=10,
+            )
+            log.info("Playing reported: %s", resp.status_code)
+        except requests.RequestException as e:
+            log.warning("failed to report Playing: %s", e)
+
+    def _report_stopped(self, position_ticks: int) -> None:
+        server = self.payload["serverAddress"].rstrip("/")
+        body = {
+            "ItemId": self.payload["itemId"],
+            "MediaSourceId": self.payload.get("mediaSourceId") or self.payload["itemId"],
+            "PlaySessionId": self._session_id(),
+            "PositionTicks": position_ticks,
         }
         try:
             resp = requests.post(
                 f"{server}/Sessions/Playing/Stopped",
-                headers=headers,
+                headers=self._auth_headers(),
                 json=body,
                 timeout=10,
             )
