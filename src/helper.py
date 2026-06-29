@@ -27,7 +27,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -166,9 +166,16 @@ class Session:
         # host) without consuming the body.
         self._log_url_diagnostic(url)
 
-        log.info("PotPlayer URL: %s", url[:200])
-        args = [self.potplayer_path, url, f"/seek={seek_arg}", f"/title={title}"]
-        log.info("launching PotPlayer: %s (seek %s)", title, seek_arg)
+        # PotPlayer parses /title= and other options by splitting argv on
+        # spaces, so a title with spaces / CJK / em-dash breaks the URL
+        # following it. Quote the title explicitly. (PotPlayer accepts
+        # /option="value with spaces" syntax.)
+        # Also keep URL as args[1] — PotPlayer treats the first non-/option
+        # arg as the file to play.
+        log.info("PotPlayer URL: %s", url)
+        title_arg = f'/title="{title}"'
+        args = [self.potplayer_path, url, f"/seek={seek_arg}", title_arg]
+        log.info("launching PotPlayer: %s (seek %s) argv=%s", title, seek_arg, args[1:])
         self.process = subprocess.Popen(args)
         self.started_at = time.time()
 
