@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Player (PotPlayer)
 // @namespace    https://github.com/shawnlu96/jellyfin-external-player
-// @version      0.1.4
+// @version      0.1.5
 // @description  Hand off Jellyfin web playback to PotPlayer; progress synced back on player close.
 // @author       shawnlu96
 // @match        *://*/*
@@ -141,6 +141,30 @@
     });
   }
 
+  /** GET that returns the raw response body as text (no JSON parse).
+   *  Used for /Items/{id}/Download which returns .strm contents (a URL line). */
+  function jellyfinGetText(serverAddress, accessToken, path) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: serverAddress + path,
+        headers: {
+          'X-Emby-Token': accessToken,
+        },
+        timeout: 15000,
+        onload: (r) => {
+          if (r.status >= 200 && r.status < 300) {
+            resolve(r.responseText || '');
+          } else {
+            reject(new Error(`jellyfin ${path} -> ${r.status}`));
+          }
+        },
+        onerror: reject,
+        ontimeout: () => reject(new Error('jellyfin timeout')),
+      });
+    });
+  }
+
   function jellyfinPost(serverAddress, accessToken, path, body) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -199,15 +223,39 @@
     const mediaSource = (playbackInfo.MediaSources || [])[0];
     if (!mediaSource) throw new Error('no MediaSource for item');
 
-    // Direct-stream URL (Jellyfin serves original file as long as Static=true)
-    const streamUrl =
-      serverAddress +
-      '/Videos/' +
-      itemId +
-      '/stream?Static=true&MediaSourceId=' +
-      encodeURIComponent(mediaSource.Id) +
-      '&api_key=' +
-      encodeURIComponent(accessToken);
+    // For .strm items, Jellyfin's /Videos/{id}/stream returns
+    // application/oct-stream which PotPlayer refuses to play. Bypass this
+    // entirely by calling /Items/{id}/Download which returns the .strm file
+    // raw contents — the first line is the real media URL (typically a
+    // direct CDN / object-storage signed link).
+    let streamUrl = null;
+    const path = item.Path || '';
+    const isStrm = /\.strm$/i.test(path) || mediaSource.Container === 'strm';
+    if (isStrm) {
+      try {
+        const strmText = await jellyfinGetText(
+          serverAddress,
+          accessToken,
+          `/Items/${itemId}/Download?api_key=${encodeURIComponent(accessToken)}`
+        );
+        const firstLine = (strmText || '').split('\n')[0].trim();
+        if (/^https?:\/\//i.test(firstLine)) {
+          streamUrl = firstLine;
+        }
+      } catch (e) {
+        console.warn('[jellyfin-external-player] strm download failed, falling back to /stream:', e);
+      }
+    }
+    if (!streamUrl) {
+      streamUrl =
+        serverAddress +
+        '/Videos/' +
+        itemId +
+        '/stream?Static=true&MediaSourceId=' +
+        encodeURIComponent(mediaSource.Id) +
+        '&api_key=' +
+        encodeURIComponent(accessToken);
+    }
 
     let title = item.Name || 'Jellyfin';
     if (item.SeriesName && item.ParentIndexNumber != null && item.IndexNumber != null) {
