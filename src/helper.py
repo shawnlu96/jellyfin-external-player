@@ -29,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.4.0"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -105,9 +105,15 @@ POTPLAYER_WINDOW_CLASSES = {
     "PotPlayer",
     "PotPlayerMini",
 }
+
+# Correct PotPlayer IPC protocol (from AHK community reverse-engineering):
+# msg = WM_USER (0x400), wParam = command code, lParam = command arg.
+# wParam 0x5004 = get current position (ms), 0x5002 = duration (ms),
+# 0x5005 = set position (ms in lParam).
 WM_USER = 0x0400
-POT_GET_CURRENT_TIME_MS = WM_USER + 0x64
-POT_GET_TOTAL_TIME_MS = WM_USER + 0x65
+POT_CMD_GET_POSITION = 0x5004
+POT_CMD_GET_DURATION = 0x5002
+POT_CMD_SET_POSITION = 0x5005
 
 _user32 = ctypes.windll.user32
 # WPARAM/LPARAM/LRESULT are pointer-sized on Windows (32-bit on x86, 64-bit
@@ -120,6 +126,16 @@ _user32.SendMessageW.argtypes = [
     ctypes.c_uint,
     ctypes.c_ssize_t,  # WPARAM
     ctypes.c_ssize_t,  # LPARAM
+]
+_user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+_user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND,
+    ctypes.c_uint,
+    ctypes.c_ssize_t,
+    ctypes.c_ssize_t,
+    ctypes.c_uint,            # flags
+    ctypes.c_uint,            # timeout (ms)
+    ctypes.POINTER(ctypes.c_ssize_t),
 ]
 _user32.GetWindowTextW.restype = ctypes.c_int
 _user32.GetClassNameW.restype = ctypes.c_int
@@ -182,8 +198,35 @@ def get_window_text(hwnd: int) -> str:
     return buf.value
 
 
-# Different PotPlayer builds expose different IPC shapes; try several and use
-# whichever returns a sensible value. Discovered through trial.
+# SendMessageTimeout — won't hang if PotPlayer's message loop is busy.
+def _send_msg_timeout(hwnd: int, msg: int, wparam: int, lparam: int = 0,
+                      timeout_ms: int = 500) -> int | None:
+    SMTO_ABORTIFHUNG = 0x0002
+    result = ctypes.c_ssize_t(0)
+    ret = _user32.SendMessageTimeoutW(
+        wintypes.HWND(hwnd),
+        ctypes.c_uint(msg),
+        ctypes.c_ssize_t(wparam),
+        ctypes.c_ssize_t(lparam),
+        SMTO_ABORTIFHUNG,
+        ctypes.c_uint(timeout_ms),
+        ctypes.byref(result),
+    )
+    return int(result.value) if ret else None
+
+
+def get_potplayer_position_ms(hwnd: int) -> int | None:
+    """Correct PotPlayer IPC: SendMessage(hwnd, WM_USER, 0x5004, 0) -> ms."""
+    v = _send_msg_timeout(hwnd, WM_USER, POT_CMD_GET_POSITION)
+    return v if (v is not None and v > 0) else None
+
+
+def get_potplayer_duration_ms(hwnd: int) -> int | None:
+    v = _send_msg_timeout(hwnd, WM_USER, POT_CMD_GET_DURATION)
+    return v if (v is not None and v > 0) else None
+
+
+# Legacy probe (was wrong) kept for reference but unused.
 IPC_PROBES = [
     # (msg, wParam, label)
     (WM_USER + 0x64, 0x64, "WM_USER+0x64,w=0x64"),
@@ -391,71 +434,40 @@ class Session:
         self._report_stopped(self.last_position_ticks)
 
     def _poll_position(self) -> None:
-        """Background poller. Strategy:
-        1. Wait 10s for PotPlayer to start playback (need real position values).
-        2. EXHAUSTIVE probe: every PotPlayer-owned window × every wParam 0..255
-           on a few candidate msg ids (0x460-0x4FF range). Log every non-zero.
-        3. Pick (hwnd, msg, wparam) returning a plausible 0..24h ms as winner.
-        4. Re-poll the winner every 2s until exit."""
-        time.sleep(10)  # let PotPlayer initialize playback
-        if not self.process or self.process.poll() is not None:
+        """Poll PotPlayer's playback position every 2s via SendMessage IPC.
+
+        Protocol (from AHK PotPlayer-Resume reverse-engineering):
+          SendMessage(hwnd, WM_USER=0x400, wParam=0x5004, lParam=0) -> ms
+        Target: any top-level window of the PotPlayer process whose class
+        is in POTPLAYER_WINDOW_CLASSES."""
+        # Wait for PotPlayer's main window to appear (max 30s)
+        target_hwnd: int | None = None
+        deadline = time.time() + 30
+        while target_hwnd is None and time.time() < deadline:
+            if not self.process or self.process.poll() is not None:
+                return
+            for h, c, _, _ in enum_all_windows_for_pid(self.process.pid):
+                if c in POTPLAYER_WINDOW_CLASSES:
+                    target_hwnd = h
+                    log.info("PotPlayer IPC target: hwnd=0x%x class=%s", h, c)
+                    break
+            if target_hwnd is None:
+                time.sleep(0.5)
+
+        if target_hwnd is None:
+            log.warning("no PotPlayer main window found within 30s")
             return
 
-        all_wins = enum_all_windows_for_pid(self.process.pid)
-        log.info(
-            "EXHAUSTIVE PROBE: enumerating %d windows for PotPlayer pid=%d",
-            len(all_wins), self.process.pid,
-        )
-        # Skip windows that can't possibly host IPC
-        skip_classes = {
-            "tooltips_class32", "IME", "MSCTFIME UI", "ComboLBox", "Edit",
-            "ComboBox", "SysTabControl32", "Static",
-        }
-        candidate_wins = [w for w in all_wins if w[1] not in skip_classes]
-        log.info("probing %d candidate windows (skipped %d noise)",
-                 len(candidate_wins), len(all_wins) - len(candidate_wins))
-
-        candidate_msgs = [0x464, 0x465, 0x460, 0x461, 0x4C8, 0x500]
-        winning: tuple[int, int, int] | None = None  # (hwnd, msg, wparam)
-
-        for h, c, t, _ in candidate_wins:
-            for msg in candidate_msgs:
-                for w in range(256):
-                    try:
-                        v = _user32.SendMessageW(h, msg, w, 0)
-                    except OSError:
-                        continue
-                    if v == 0:
-                        continue
-                    # Any non-zero response — log it
-                    plausible_ms = 0 < v < 24 * 3600 * 1000
-                    log.info(
-                        "  RESPONSE: hwnd=0x%x class=%r msg=0x%x w=0x%x -> %d %s",
-                        h, c, msg, w, v,
-                        "[PLAUSIBLE ms!]" if plausible_ms else "",
-                    )
-                    if plausible_ms and winning is None:
-                        winning = (h, msg, w)
-                        log.info("  WINNER LOCKED: %s", winning)
-
-        if winning is None:
-            log.warning(
-                "EXHAUSTIVE PROBE found no plausible IPC response — "
-                "this PotPlayer build does not expose SendMessage IPC. "
-                "Switching to mpv is the only path to accurate progress."
-            )
-            return
-
-        # Re-poll winner every 2s
-        hwnd, msg, wparam = winning
+        first_log = False
         while self.process and self.process.poll() is None:
-            try:
-                v = _user32.SendMessageW(hwnd, msg, wparam, 0)
-                if 0 < v < 24 * 3600 * 1000:
-                    self.last_position_ticks = int(v) * 10_000
-                    self.ipc_succeeded = True
-            except OSError:
-                pass
+            pos_ms = get_potplayer_position_ms(target_hwnd)
+            if pos_ms is not None and pos_ms > 0:
+                self.last_position_ticks = pos_ms * 10_000  # ms -> 100ns ticks
+                self.ipc_succeeded = True
+                if not first_log:
+                    dur_ms = get_potplayer_duration_ms(target_hwnd) or 0
+                    log.info("IPC ok: position=%dms duration=%dms", pos_ms, dur_ms)
+                    first_log = True
             time.sleep(2)
 
     def _session_id(self) -> str:
