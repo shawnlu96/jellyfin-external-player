@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Player (PotPlayer)
 // @namespace    https://github.com/shawnlu96/jellyfin-external-player
-// @version      0.1.0
+// @version      0.1.1
 // @description  Hand off Jellyfin web playback to PotPlayer; progress synced back on player close.
 // @author       shawnlu96
 // @match        *://*/*
@@ -19,28 +19,49 @@
   'use strict';
 
   // -----------------------------------------------------------------------
-  // 1. Strict Jellyfin fingerprint — meta tag OR ApiClient shape
-  //    (meta tag = page identity; ApiClient = SDK ready). For activation we
-  //    accept either, but onClick will hard-require ApiClient to be ready.
+  // 1. Strict Jellyfin fingerprint — meta tag OR localStorage credentials
+  //    We DO NOT rely on window.ApiClient: Tampermonkey runs in a sandbox
+  //    whose window often can't see page-level globals; also Jellyfin 10.10+
+  //    no longer guarantees window.ApiClient is exposed.
   // -----------------------------------------------------------------------
   function hasJellyfinMeta() {
     const meta = document.querySelector('meta[name="application-name"]');
     return !!(meta && meta.content === 'Jellyfin');
   }
 
-  function hasApiClient() {
-    const c = window.ApiClient;
-    return !!(
-      c &&
-      typeof c.serverAddress === 'function' &&
-      typeof c.getCurrentUserId === 'function' &&
-      typeof c.accessToken === 'function' &&
-      typeof c.getJSON === 'function'
-    );
+  /** Read the Jellyfin web credentials persisted by the SPA into localStorage.
+   *  Returns the active server object (with AccessToken + UserId + ManualAddress)
+   *  or null if not logged in / not Jellyfin. */
+  function getCredentials() {
+    try {
+      const raw = localStorage.getItem('jellyfin_credentials');
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      const servers = (data && data.Servers) || [];
+      const valid = servers.filter(
+        (s) => s && s.AccessToken && s.UserId && (s.ManualAddress || s.LocalAddress || s.RemoteAddress)
+      );
+      if (!valid.length) return null;
+      // Prefer server matching ?serverId= in URL hash, else most recent (DateLastAccessed)
+      const urlServerId = new URLSearchParams(
+        (location.hash || '').split('?')[1] || ''
+      ).get('serverId');
+      const matched = urlServerId && valid.find((s) => s.Id === urlServerId);
+      if (matched) return matched;
+      // Fallback: most recently accessed
+      valid.sort((a, b) => (b.DateLastAccessed || 0) - (a.DateLastAccessed || 0));
+      return valid[0];
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function getServerAddress(creds) {
+    return creds.ManualAddress || creds.LocalAddress || creds.RemoteAddress || '';
   }
 
   function isJellyfin() {
-    return hasJellyfinMeta() || hasApiClient();
+    return hasJellyfinMeta() || !!getCredentials();
   }
 
   // Defer until ApiClient is ready (Jellyfin SPA loads it async)
@@ -90,24 +111,95 @@
   }
 
   // -----------------------------------------------------------------------
-  // 3. Build payload from Jellyfin ApiClient for current item
+  // 3. HTTP to Jellyfin server using stored credentials (via GM_xmlhttpRequest
+  //    to bypass CORS / mixed-content from Tampermonkey sandbox).
+  // -----------------------------------------------------------------------
+  function jellyfinGet(serverAddress, accessToken, path) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: serverAddress + path,
+        headers: {
+          'X-Emby-Token': accessToken,
+          Accept: 'application/json',
+        },
+        timeout: 15000,
+        onload: (r) => {
+          if (r.status >= 200 && r.status < 300) {
+            try {
+              resolve(JSON.parse(r.responseText));
+            } catch (e) {
+              reject(new Error('invalid json from jellyfin'));
+            }
+          } else {
+            reject(new Error(`jellyfin ${path} -> ${r.status}`));
+          }
+        },
+        onerror: reject,
+        ontimeout: () => reject(new Error('jellyfin timeout')),
+      });
+    });
+  }
+
+  function jellyfinPost(serverAddress, accessToken, path, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: serverAddress + path,
+        headers: {
+          'X-Emby-Token': accessToken,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        data: JSON.stringify(body),
+        timeout: 15000,
+        onload: (r) => {
+          if (r.status >= 200 && r.status < 300) {
+            try {
+              resolve(r.responseText ? JSON.parse(r.responseText) : {});
+            } catch {
+              resolve({});
+            }
+          } else {
+            reject(new Error(`jellyfin ${path} -> ${r.status}: ${r.responseText.slice(0, 200)}`));
+          }
+        },
+        onerror: reject,
+        ontimeout: () => reject(new Error('jellyfin timeout')),
+      });
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // 4. Build payload — uses ONLY localStorage credentials + HTTP API.
   // -----------------------------------------------------------------------
   async function buildPayload(itemId) {
-    const c = window.ApiClient;
-    const serverAddress = c.serverAddress();
-    const accessToken = c.accessToken();
-    const userId = c.getCurrentUserId();
+    const creds = getCredentials();
+    if (!creds) throw new Error('no credentials in localStorage — log in to Jellyfin first');
+    const serverAddress = getServerAddress(creds);
+    const accessToken = creds.AccessToken;
+    const userId = creds.UserId;
 
-    // Fetch item + playback info
-    const item = await c.getItem(userId, itemId);
-    const playbackInfo = await c.getPlaybackInfo(itemId, {
-      UserId: userId,
-      MaxStreamingBitrate: 200_000_000,
-    });
+    // Fetch item + playback info via HTTP API
+    const item = await jellyfinGet(
+      serverAddress,
+      accessToken,
+      `/Users/${userId}/Items/${itemId}`
+    );
+    const playbackInfo = await jellyfinPost(
+      serverAddress,
+      accessToken,
+      `/Items/${itemId}/PlaybackInfo?UserId=${encodeURIComponent(userId)}`,
+      {
+        UserId: userId,
+        MaxStreamingBitrate: 200_000_000,
+        DeviceProfile: { MaxStreamingBitrate: 200_000_000 },
+      }
+    );
     const mediaSource = (playbackInfo.MediaSources || [])[0];
     if (!mediaSource) throw new Error('no MediaSource for item');
 
-    // Build direct-stream URL (Jellyfin serves transcoded/remuxed if needed)
+    // Direct-stream URL (Jellyfin serves original file as long as Static=true)
     const streamUrl =
       serverAddress +
       '/Videos/' +
@@ -130,7 +222,7 @@
       playSessionId: playbackInfo.PlaySessionId,
       streamUrl,
       title,
-      startPositionTicks: item.UserData?.PlaybackPositionTicks || 0,
+      startPositionTicks: (item.UserData && item.UserData.PlaybackPositionTicks) || 0,
     };
   }
 
@@ -189,19 +281,13 @@
       toast('No item id detected on this page');
       return;
     }
-    if (!hasApiClient()) {
-      // Wait briefly — Jellyfin SPA might still be booting ApiClient
-      try {
-        await waitFor(hasApiClient, 5000);
-      } catch {
-        toast('Jellyfin SDK (ApiClient) not loaded — make sure you are logged in to Jellyfin web');
-        return;
-      }
-    }
-    const server = window.ApiClient.serverAddress();
-    const token = window.ApiClient.accessToken();
-    if (!server || !token) {
+    const creds = getCredentials();
+    if (!creds || !creds.AccessToken || !creds.UserId) {
       toast('Not logged in to Jellyfin — please log in first');
+      return;
+    }
+    if (!getServerAddress(creds)) {
+      toast('Jellyfin server address missing from credentials');
       return;
     }
     try {
