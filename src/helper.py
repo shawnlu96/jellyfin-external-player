@@ -29,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -110,8 +110,19 @@ POT_GET_CURRENT_TIME_MS = WM_USER + 0x64
 POT_GET_TOTAL_TIME_MS = WM_USER + 0x65
 
 _user32 = ctypes.windll.user32
-_user32.SendMessageW.restype = ctypes.c_long
-_user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_long, ctypes.c_long]
+# WPARAM/LPARAM/LRESULT are pointer-sized on Windows (32-bit on x86, 64-bit
+# on x64). ctypes.c_long is always 32-bit on Windows — using it would
+# truncate wParam=0x64 to 0 on a 64-bit Python and PotPlayer would not
+# recognize the IPC request. ctypes.c_ssize_t is platform-correct.
+_user32.SendMessageW.restype = ctypes.c_ssize_t
+_user32.SendMessageW.argtypes = [
+    wintypes.HWND,
+    ctypes.c_uint,
+    ctypes.c_ssize_t,  # WPARAM
+    ctypes.c_ssize_t,  # LPARAM
+]
+_user32.GetWindowTextW.restype = ctypes.c_int
+_user32.GetClassNameW.restype = ctypes.c_int
 
 _EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
