@@ -29,7 +29,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -134,25 +134,51 @@ def find_potplayer_window() -> int | None:
     return found[0] if found else None
 
 
-def get_potplayer_position_ms(hwnd: int) -> int | None:
-    """Query PotPlayer for current playback position in milliseconds.
-
-    PotPlayer's reverse-engineered API uses wParam=0x64 (not 0) on
-    WM_USER+0x64 to get current time; wParam=0x65 gets duration.
-    """
-    try:
-        pos = _user32.SendMessageW(hwnd, POT_GET_CURRENT_TIME_MS, 0x64, 0)
-        return int(pos) if pos > 0 else None
-    except OSError:
-        return None
+def get_window_text(hwnd: int) -> str:
+    """Read the title of a top-level window."""
+    buf = ctypes.create_unicode_buffer(512)
+    _user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
 
 
-def get_potplayer_duration_ms(hwnd: int) -> int | None:
-    try:
-        dur = _user32.SendMessageW(hwnd, POT_GET_CURRENT_TIME_MS, 0x65, 0)
-        return int(dur) if dur > 0 else None
-    except OSError:
-        return None
+# Different PotPlayer builds expose different IPC shapes; try several and use
+# whichever returns a sensible value. Discovered through trial.
+IPC_PROBES = [
+    # (msg, wParam, label)
+    (WM_USER + 0x64, 0x64, "WM_USER+0x64,w=0x64"),
+    (WM_USER + 0x64, 0,    "WM_USER+0x64,w=0"),
+    (WM_USER + 0x100, 0,   "WM_USER+0x100,w=0"),
+    (WM_USER + 0x5000, 0,  "WM_USER+0x5000,w=0"),
+    (WM_USER + 100, 0x5000, "WM_USER+100,w=0x5000"),
+]
+
+
+def probe_potplayer_position(hwnd: int) -> tuple[int | None, str]:
+    """Try every known IPC shape. Return (position_ms, which_probe_worked)."""
+    for msg, wparam, label in IPC_PROBES:
+        try:
+            v = _user32.SendMessageW(hwnd, msg, wparam, 0)
+            if v and 0 < v < 24 * 3600 * 1000:  # plausible 0..24h in ms
+                return int(v), label
+        except OSError:
+            continue
+    return None, ""
+
+
+def parse_position_from_title(title: str) -> int | None:
+    """Extract HH:MM:SS or MM:SS from PotPlayer window title if present.
+
+    PotPlayer default format: '00:12:34 / 00:24:01 - filename'."""
+    import re
+    m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})", title)
+    if m:
+        h, mi, s = (int(x) for x in m.groups())
+        return (h * 3600 + mi * 60 + s) * 1000
+    m = re.search(r"\b(\d{1,3}):(\d{2})\b", title)
+    if m:
+        mi, s = (int(x) for x in m.groups())
+        return (mi * 60 + s) * 1000
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -324,10 +350,16 @@ class Session:
         self._report_stopped(self.last_position_ticks)
 
     def _poll_position(self) -> None:
-        """Background poller: every 2s ask PotPlayer where it is."""
+        """Background poller: every 2s ask PotPlayer where it is.
+
+        Strategy: try each known IPC probe in IPC_PROBES; whichever returns a
+        plausible value (0..24h) wins. As a third-tier fallback, parse the
+        playback timestamp from the window title (PotPlayer shows it by
+        default in "HH:MM:SS / HH:MM:SS - filename" form)."""
         hwnd: int | None = None
         hwnd_search_deadline = time.time() + 30
-        logged_first_pos = False
+        logged_first = False
+        winning_probe: str = ""
         while self.process and self.process.poll() is None:
             if hwnd is None:
                 if time.time() > hwnd_search_deadline:
@@ -337,18 +369,41 @@ class Session:
                 if hwnd is None:
                     time.sleep(0.5)
                     continue
-                log.info("PotPlayer hwnd: 0x%x", hwnd)
-            pos_ms = get_potplayer_position_ms(hwnd)
+                log.info("PotPlayer hwnd: 0x%x title=%s", hwnd, get_window_text(hwnd)[:120])
+
+            pos_ms: int | None = None
+            if winning_probe:
+                # Stick with whichever probe worked last time
+                for msg, wparam, label in IPC_PROBES:
+                    if label == winning_probe:
+                        try:
+                            v = _user32.SendMessageW(hwnd, msg, wparam, 0)
+                            if v and 0 < v < 24 * 3600 * 1000:
+                                pos_ms = int(v)
+                        except OSError:
+                            pass
+                        break
+            if pos_ms is None:
+                pos_ms, label = probe_potplayer_position(hwnd)
+                if pos_ms is not None and not winning_probe:
+                    winning_probe = label
+                    log.info("IPC probe winner: %s = %dms", label, pos_ms)
+
+            if pos_ms is None:
+                # Last-resort: scrape window title
+                title = get_window_text(hwnd)
+                title_pos = parse_position_from_title(title)
+                if title_pos is not None:
+                    pos_ms = title_pos
+                    if not logged_first:
+                        log.info("position from title: %dms (title=%r)", pos_ms, title[:80])
+
             if pos_ms is not None and pos_ms > 0:
-                self.last_position_ticks = pos_ms * 10_000  # ms -> 100ns ticks
+                self.last_position_ticks = pos_ms * 10_000
                 self.ipc_succeeded = True
-                if not logged_first_pos:
-                    dur_ms = get_potplayer_duration_ms(hwnd) or 0
-                    log.info(
-                        "IPC ok: position=%dms duration=%dms",
-                        pos_ms, dur_ms,
-                    )
-                    logged_first_pos = True
+                if not logged_first:
+                    log.info("first observed position: %dms", pos_ms)
+                    logged_first = True
             time.sleep(2)
 
     def _session_id(self) -> str:
