@@ -27,7 +27,7 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 54321
 APP_NAME = "JellyfinExternalPlayer"
 APP_DISPLAY = "Jellyfin External Player"
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 GITHUB_REPO = "shawnlu96/jellyfin-external-player"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 3600  # daily
 LOG_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
@@ -156,31 +156,41 @@ class Session:
         seek_seconds = self.start_position_ticks // 10_000_000
         seek_arg = time.strftime("%H:%M:%S", time.gmtime(seek_seconds))
 
-        # Jellyfin /Videos/{id}/stream returns application/oct-stream which
-        # PotPlayer doesn't recognize as video. Hint the container via the
-        # /stream.mkv URL form — Jellyfin then returns video/x-matroska and
-        # PotPlayer plays it directly.
-        if "/stream?" in url and ".mkv" not in url and ".mp4" not in url:
-            url = url.replace("/stream?", "/stream.mkv?", 1)
-            log.info("rewrote stream URL with .mkv container hint")
-
-        # Preflight: check what Jellyfin's /Videos/.../stream actually returns.
-        # For .strm items, Jellyfin should 302-redirect to the real media URL.
-        # If we see a 302, follow it manually so PotPlayer gets the final URL —
-        # some PotPlayer builds choke on the redirect chain especially when the
-        # destination is on a different host (alipan OSS etc).
-        final_url = self._resolve_redirect(url)
-        if final_url != url:
-            log.info("preflight: %s -> %s", url[:120], final_url[:120])
-            url = final_url
-        else:
-            log.info("preflight: direct stream (no redirect)")
+        # IMPORTANT: do NOT preflight-resolve the URL. Many object-storage
+        # signed URLs (alipan OSS, S3 pre-signed, etc.) are single-use or
+        # time-sensitive — consuming the redirect ourselves invalidates the
+        # link before PotPlayer gets to it. Let PotPlayer follow any 302s
+        # itself, fresh each time.
+        #
+        # We still HEAD the URL once for diagnostic logging (status + final
+        # host) without consuming the body.
+        self._log_url_diagnostic(url)
 
         log.info("PotPlayer URL: %s", url[:200])
         args = [self.potplayer_path, url, f"/seek={seek_arg}", f"/title={title}"]
         log.info("launching PotPlayer: %s (seek %s)", title, seek_arg)
         self.process = subprocess.Popen(args)
         self.started_at = time.time()
+
+    def _log_url_diagnostic(self, url: str) -> None:
+        """HEAD-only probe to log what the URL responds with. Best-effort —
+        if HEAD is refused (some object stores reject HEAD), just log and
+        move on; PotPlayer will GET it itself."""
+        try:
+            resp = requests.head(
+                url,
+                allow_redirects=False,
+                timeout=5,
+                headers={"User-Agent": "JellyfinExternalPlayer/diagnostic"},
+            )
+            log.info(
+                "url HEAD: status=%d content-type=%s location=%s",
+                resp.status_code,
+                resp.headers.get("Content-Type", "?"),
+                resp.headers.get("Location", "")[:200],
+            )
+        except requests.RequestException as e:
+            log.info("url HEAD failed (non-fatal): %s", e)
 
     def _resolve_redirect(self, url: str, depth: int = 0) -> str:
         """Follow Jellyfin's stream URL through redirects; return the final
