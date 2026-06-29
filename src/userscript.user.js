@@ -19,11 +19,16 @@
   'use strict';
 
   // -----------------------------------------------------------------------
-  // 1. Strict Jellyfin fingerprint — meta tag + ApiClient shape
+  // 1. Strict Jellyfin fingerprint — meta tag OR ApiClient shape
+  //    (meta tag = page identity; ApiClient = SDK ready). For activation we
+  //    accept either, but onClick will hard-require ApiClient to be ready.
   // -----------------------------------------------------------------------
-  function isJellyfin() {
+  function hasJellyfinMeta() {
     const meta = document.querySelector('meta[name="application-name"]');
-    if (meta && meta.content === 'Jellyfin') return true;
+    return !!(meta && meta.content === 'Jellyfin');
+  }
+
+  function hasApiClient() {
     const c = window.ApiClient;
     return !!(
       c &&
@@ -32,6 +37,10 @@
       typeof c.accessToken === 'function' &&
       typeof c.getJSON === 'function'
     );
+  }
+
+  function isJellyfin() {
+    return hasJellyfinMeta() || hasApiClient();
   }
 
   // Defer until ApiClient is ready (Jellyfin SPA loads it async)
@@ -178,6 +187,21 @@
     const itemId = getItemIdFromUrl();
     if (!itemId) {
       toast('No item id detected on this page');
+      return;
+    }
+    if (!hasApiClient()) {
+      // Wait briefly — Jellyfin SPA might still be booting ApiClient
+      try {
+        await waitFor(hasApiClient, 5000);
+      } catch {
+        toast('Jellyfin SDK (ApiClient) not loaded — make sure you are logged in to Jellyfin web');
+        return;
+      }
+    }
+    const server = window.ApiClient.serverAddress();
+    const token = window.ApiClient.accessToken();
+    if (!server || !token) {
+      toast('Not logged in to Jellyfin — please log in first');
       return;
     }
     try {
